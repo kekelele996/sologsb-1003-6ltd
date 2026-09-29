@@ -11,6 +11,9 @@ export const seedSegments: Segment[] = [
   { id: 'seg-08', index: 8, kind: 'paragraph', sourceText: 'If the controller cannot reach the API server, check the network policy and then restart the pod.', targetText: '如果控制器无法连接 API 服务器，请检查网络策略，然后重启 Pod。', status: 'draft', protectedTokens: [], note: '' },
   { id: 'seg-09', index: 9, kind: 'link', sourceText: 'See [Troubleshooting](https://docs.example.com/troubleshooting#connectivity) for detailed diagnostics.', targetText: '详细诊断请参阅 [故障排查](https://docs.example.com/troubleshooting)。', status: 'returned', protectedTokens: ['https://docs.example.com/troubleshooting#connectivity'], note: '锚点链接丢失，需要修复。' },
   { id: 'seg-10', index: 10, kind: 'heading', sourceText: '## Upgrade Notes', targetText: '', status: 'draft', protectedTokens: [], note: '漏译示例。' },
+  { id: 'seg-11', index: 11, kind: 'paragraph', sourceText: 'For more information, see the official documentation.', targetText: '更多信息请参阅官方文档。', status: 'draft', protectedTokens: [], note: '本句在新版中重复出现。' },
+  { id: 'seg-12', index: 12, kind: 'paragraph', sourceText: 'Logs are kept for seven days.', targetText: '日志保留七天。', status: 'draft', protectedTokens: [], note: '新版与相邻段落合并。' },
+  { id: 'seg-13', index: 13, kind: 'paragraph', sourceText: 'Old log files are deleted automatically.', targetText: '旧日志文件会自动删除。', status: 'draft', protectedTokens: [], note: '新版与相邻段落合并。' },
 ]
 
 export const seedGlossary: GlossaryTerm[] = [
@@ -48,3 +51,38 @@ export const seedDocument: LocalizationDocument = {
   glossary: seedGlossary,
   discussions: seedDiscussions,
 }
+
+/** 内置新版示例：覆盖移动、轻改、拆分、合并、重复、移除、新增等迁移场景。 */
+export const sampleV2Markdown = `# Deployment Guide
+
+## Prerequisites
+
+This guide explains how to deploy {{project_name}} version {{version}} to a Kubernetes cluster.
+
+Before you begin, review the [configuration reference](https://docs.example.com/config) and install \`kubectl\`.
+
+The operator requires cluster-admin privileges during installation. Production environments must use a dedicated service account.
+
+\`\`\`bash
+helm upgrade --install {{release_name}} oci://registry.example.com/operator --version {{version}}
+\`\`\`
+
+Set \`replicaCount\` to \`{replica_count}\` in your values file.
+
+The operator will reject the change when the value is zero or negative.
+
+If the controller cannot reach the API server, check the network policy.
+
+Then restart the pod to apply the recovered network policy.
+
+For more information, see the official documentation.
+
+See [Troubleshooting](https://docs.example.com/troubleshooting#connectivity) for detailed diagnostics.
+
+Logs are kept for seven days, and old log files are deleted automatically after that period.
+
+For more information, see the official documentation.
+
+If a Helm release fails, run the rollback command to restore the previous revision.`
+
+export const sampleV2SourceFile = 'docs/deployment-v2.md'

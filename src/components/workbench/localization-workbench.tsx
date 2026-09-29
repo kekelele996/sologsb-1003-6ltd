@@ -3,8 +3,8 @@
 import { useEffect, useMemo, useRef, useState, type ChangeEvent } from 'react'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import {
-  AlertCircle, ArrowDown, ArrowUp, BookOpen, Check, CheckCheck, ChevronLeft, ChevronRight,
-  CircleAlert, Cloud, CloudOff, Code2, Download, FileText, GitCompare, History, Import,
+  AlertCircle, Archive, ArrowDown, ArrowUp, BookOpen, Check, CheckCheck, ChevronLeft, ChevronRight,
+  CircleAlert, Cloud, CloudOff, Code2, Download, FileText, GitCompare, GitPullRequestArrow, History, Import,
   Languages, Link2, Loader2, MessageSquare, RefreshCw, RotateCcw, RotateCw, Save, Search,
   Send, ShieldCheck, Sparkles, Undo2, UndoDot, Variable, X,
 } from 'lucide-react'
@@ -15,18 +15,33 @@ import { Input } from '@/components/ui/input'
 import { Progress } from '@/components/ui/progress'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Textarea } from '@/components/ui/textarea'
+import { MigrationWizard } from '@/components/workbench/migration-wizard'
 import { analyzeDocument, extractVariables, parseMarkdown, renderTargetMarkdown } from '@/lib/markdown'
-import { seedConflicts, seedDiscussions, seedDocument, seedGlossary, seedHistory, seedSegments } from '@/lib/seed'
-import type { Discussion, GlossaryTerm, HistoryEntry, Segment, SegmentStatus, TranslationConflict, TranslationIssue } from '@/lib/types'
+import {
+  applyMigration, loadMigrationSession, planMigration, saveMigrationSession,
+} from '@/lib/migration'
+import { sampleV2Markdown, sampleV2SourceFile, seedConflicts, seedDiscussions, seedDocument, seedGlossary, seedHistory, seedSegments } from '@/lib/seed'
+import type {
+  ArchivedSegment, Discussion, GlossaryTerm, HistoryEntry, MigrationSession, Segment, SegmentStatus,
+  TranslationConflict, TranslationIssue,
+} from '@/lib/types'
 import { cn } from '@/lib/utils'
 
 const DRAFT_KEY = 'sologsb-1003-localization-draft-v1'
+const historyActionLabel: Record<HistoryEntry['action'], string> = {
+  edit: '编辑', confirm: '确认', return: '退回', 'resolve-conflict': '解决冲突', import: '导入', discussion: '讨论', migrate: '版本迁移',
+}
+const migratedLabel: Record<NonNullable<Segment['migratedMatch']>, string> = {
+  exact: '完全相同 · 沿用', moved: '位置移动 · 沿用', similar: '文字轻改 · 待复核', split: '拆分 · 待复核',
+  merge: '合并 · 待复核', duplicate: '重复段落 · 沿用', manual: '人工指定 · 待复核', new: '新版新增', removed: '旧版移除',
+}
 const kindIcon = { heading: <FileText className="h-3.5 w-3.5" />, paragraph: <FileText className="h-3.5 w-3.5" />, code: <Code2 className="h-3.5 w-3.5" />, link: <Link2 className="h-3.5 w-3.5" />, variable: <Variable className="h-3.5 w-3.5" /> }
 const kindLabel: Record<Segment['kind'], string> = { heading: '标题', paragraph: '段落', code: '代码块', link: '链接', variable: '占位符' }
-const statusLabel: Record<SegmentStatus, string> = { draft: '草稿', 'needs-work': '待处理', confirmed: '已确认', returned: '已退回' }
+const statusLabel: Record<SegmentStatus, string> = { draft: '草稿', 'needs-work': '待处理', confirmed: '已确认', returned: '已退回', 'needs-review': '待复核' }
 const statusClass: Record<SegmentStatus, string> = {
   draft: 'bg-slate-100 text-slate-700', 'needs-work': 'bg-amber-100 text-amber-800',
   confirmed: 'bg-emerald-100 text-emerald-800', returned: 'bg-red-100 text-red-800',
+  'needs-review': 'bg-orange-100 text-orange-800',
 }
 const issueLabel: Record<TranslationIssue['type'], string> = {
   'missing-translation': '漏译', 'missing-variable': '变量缺失', 'link-mismatch': '链接不一致', glossary: '术语不一致', 'code-format': '代码格式',
@@ -36,6 +51,7 @@ const clone = <T,>(value: T): T => JSON.parse(JSON.stringify(value)) as T
 interface EditorSnapshot {
   segments: Segment[]
   discussions: Discussion[]
+  archived: ArchivedSegment[]
 }
 
 export function LocalizationWorkbench() {
@@ -48,7 +64,7 @@ export function LocalizationWorkbench() {
   const [checkedIssues, setCheckedIssues] = useState<TranslationIssue[] | null>(null)
   const [selectedSegmentId, setSelectedSegmentId] = useState('seg-05')
   const [mode, setMode] = useState<'translate' | 'review'>('translate')
-  const [filter, setFilter] = useState<'all' | 'issues' | 'untranslated' | 'confirmed'>('all')
+  const [filter, setFilter] = useState<'all' | 'issues' | 'untranslated' | 'confirmed' | 'needs-review'>('all')
   const [glossarySearch, setGlossarySearch] = useState('')
   const [discussionDraft, setDiscussionDraft] = useState('')
   const [selectedForReturn, setSelectedForReturn] = useState<Set<string>>(new Set())
@@ -57,6 +73,10 @@ export function LocalizationWorkbench() {
   const [hydrated, setHydrated] = useState(false)
   const [past, setPast] = useState<EditorSnapshot[]>([])
   const [future, setFuture] = useState<EditorSnapshot[]>([])
+  const [migrationSession, setMigrationSession] = useState<MigrationSession | null>(null)
+  const [applyingMigration, setApplyingMigration] = useState(false)
+  const [archived, setArchived] = useState<ArchivedSegment[]>([])
+  const [sourceFile, setSourceFile] = useState(seedDocument.sourceFile)
 
   const documentQuery = useQuery({
     queryKey: ['localization-document'],
@@ -105,7 +125,7 @@ export function LocalizationWorkbench() {
     },
     onSuccess: () => {
       setDirty(false)
-      try { localStorage.setItem(DRAFT_KEY, JSON.stringify({ segments, discussions, glossary, history })) } catch { /* storage may be unavailable */ }
+      try { localStorage.setItem(DRAFT_KEY, JSON.stringify({ segments, discussions, glossary, history, conflicts, archived, sourceFile })) } catch { /* storage may be unavailable */ }
     },
   })
   const reviewMutation = useMutation({
@@ -126,6 +146,7 @@ export function LocalizationWorkbench() {
   const filteredSegments = useMemo(() => segments.filter((segment) => {
     if (filter === 'issues') return issueSegmentIds.has(segment.id)
     if (filter === 'untranslated') return !segment.targetText.trim()
+    if (filter === 'needs-review') return segment.status === 'needs-review'
     if (filter === 'confirmed') return segment.status === 'confirmed'
     return true
   }), [filter, issueSegmentIds, segments])
@@ -142,22 +163,39 @@ export function LocalizationWorkbench() {
     try {
       const raw = localStorage.getItem(DRAFT_KEY)
       if (raw) {
-        const draft = JSON.parse(raw) as { segments: Segment[]; discussions: Discussion[]; glossary: GlossaryTerm[]; history: HistoryEntry[] }
+        const draft = JSON.parse(raw) as {
+          segments: Segment[]
+          discussions: Discussion[]
+          glossary: GlossaryTerm[]
+          history: HistoryEntry[]
+          conflicts?: TranslationConflict[]
+          archived?: ArchivedSegment[]
+          sourceFile?: string
+        }
         if (draft.segments?.length) {
           setSegments(draft.segments)
           setDiscussions(draft.discussions ?? seedDiscussions)
           setGlossary(draft.glossary ?? seedGlossary)
           setHistory(draft.history ?? seedHistory)
+          setConflicts(draft.conflicts ?? seedConflicts)
+          setArchived(draft.archived ?? [])
+          if (draft.sourceFile) setSourceFile(draft.sourceFile)
         }
       }
+      setMigrationSession(loadMigrationSession())
     } catch { /* start from seed */ }
     setHydrated(true)
   }, [hydrated])
 
   useEffect(() => {
     if (!hydrated) return
-    try { localStorage.setItem(DRAFT_KEY, JSON.stringify({ segments, discussions, glossary, history })) } catch { /* storage may be unavailable */ }
-  }, [discussions, glossary, history, hydrated, segments])
+    try { localStorage.setItem(DRAFT_KEY, JSON.stringify({ segments, discussions, glossary, history, conflicts, archived, sourceFile })) } catch { /* storage may be unavailable */ }
+  }, [archived, conflicts, discussions, glossary, history, hydrated, segments, sourceFile])
+
+  useEffect(() => {
+    if (!hydrated) return
+    saveMigrationSession(migrationSession)
+  }, [hydrated, migrationSession])
 
   useEffect(() => {
     const beforeUnload = (event: BeforeUnloadEvent) => {
@@ -169,7 +207,7 @@ export function LocalizationWorkbench() {
     return () => window.removeEventListener('beforeunload', beforeUnload)
   }, [dirty])
 
-  const snapshot = (): EditorSnapshot => ({ segments: clone(segments), discussions: clone(discussions) })
+  const snapshot = (): EditorSnapshot => ({ segments: clone(segments), discussions: clone(discussions), archived: clone(archived) })
   const pushHistoryEntry = (segmentId: string, action: HistoryEntry['action'], before: string, after: string, author = '当前用户') => {
     setHistory((current) => [{ id: `history-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`, segmentId, author, action, before, after, createdAt: Date.now() }, ...current])
   }
@@ -178,18 +216,19 @@ export function LocalizationWorkbench() {
     setFuture([])
     setSegments(next.segments)
     setDiscussions(next.discussions)
+    setArchived(next.archived ?? archived)
     setCheckedIssues(null)
     if (markDirty) setDirty(true)
   }
   const updateTarget = (segment: Segment, targetText: string) => {
     const next = segments.map((item) => item.id === segment.id ? { ...item, targetText, status: item.status === 'confirmed' ? 'draft' as const : item.status } : item)
-    replaceState({ segments: next, discussions: clone(discussions) })
+    replaceState({ segments: next, discussions: clone(discussions), archived: clone(archived) })
   }
   const updateStatus = (segmentId: string, status: SegmentStatus, action: HistoryEntry['action'] = status === 'confirmed' ? 'confirm' : 'return') => {
     const segment = segments.find((item) => item.id === segmentId)
     if (!segment) return
     const next = segments.map((item) => item.id === segmentId ? { ...item, status } : item)
-    replaceState({ segments: next, discussions: clone(discussions) })
+    replaceState({ segments: next, discussions: clone(discussions), archived: clone(archived) })
     pushHistoryEntry(segmentId, action, segment.targetText, segment.targetText)
     setSelectedForReturn((current) => { const copy = new Set(current); copy.delete(segmentId); return copy })
   }
@@ -227,7 +266,7 @@ export function LocalizationWorkbench() {
   const addDiscussion = () => {
     if (!selectedSegment || !discussionDraft.trim()) return
     const nextDiscussion: Discussion = { id: `discussion-${Date.now()}`, segmentId: selectedSegment.id, author: '译者 · 当前用户', body: discussionDraft.trim(), resolved: false, createdAt: Date.now() }
-    replaceState({ segments: clone(segments), discussions: [nextDiscussion, ...discussions] })
+    replaceState({ segments: clone(segments), discussions: [nextDiscussion, ...discussions], archived: clone(archived) })
     pushHistoryEntry(selectedSegment.id, 'discussion', '', nextDiscussion.body)
     setDiscussionDraft('')
   }
@@ -235,7 +274,7 @@ export function LocalizationWorkbench() {
     if (!selectedForReturn.size) return
     const ids = Array.from(selectedForReturn)
     const next = segments.map((segment) => ids.includes(segment.id) ? { ...segment, status: 'returned' as const } : segment)
-    replaceState({ segments: next, discussions: clone(discussions) })
+    replaceState({ segments: next, discussions: clone(discussions), archived: clone(archived) })
     ids.forEach((id) => pushHistoryEntry(id, 'return', returnReason, `退回原因：${returnReason}`, '审校 · 当前用户'))
     void reviewMutation.mutateAsync({ action: 'bulk-return', segmentIds: ids, reason: returnReason })
     setSelectedForReturn(new Set())
@@ -244,26 +283,70 @@ export function LocalizationWorkbench() {
     const targetText = strategy === 'local' ? conflict.localText : conflict.remoteText
     const segment = segments.find((item) => item.id === conflict.segmentId)
     const next = segments.map((item) => item.id === conflict.segmentId ? { ...item, targetText, status: 'draft' as const } : item)
-    replaceState({ segments: next, discussions: clone(discussions) })
+    replaceState({ segments: next, discussions: clone(discussions), archived: clone(archived) })
     if (segment) pushHistoryEntry(segment.id, 'resolve-conflict', segment.targetText, targetText, strategy === 'local' ? '保留本地' : conflict.remoteAuthor)
     setConflicts((current) => current.filter((item) => item.id !== conflict.id))
+  }
+  const beginMigration = (markdown: string, name: string) => {
+    const parsed = parseMarkdown(markdown)
+    if (!parsed.length) return
+    // 已有任意译文/讨论/历史时走版本迁移；纯空文档才直接导入，避免清空旧译文。
+    const hasWork = segments.some((segment) => segment.targetText.trim()) || discussions.length > 0
+    if (!hasWork) {
+      replaceState({ segments: parsed.map((segment, index) => ({ ...segment, index: index + 1 })), discussions: [], archived: [] })
+      setArchived([])
+      setSourceFile(name)
+      pushHistoryEntry(parsed[0].id, 'import', '', name)
+      setSelectedSegmentId(parsed[0].id)
+      return
+    }
+    setMigrationSession(planMigration({ oldSegments: segments, newSegments: parsed, sourceFile: name }))
   }
   const importMarkdown = async (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0]
     if (!file) return
-    const imported = parseMarkdown(await file.text())
-    if (!imported.length) return
-    replaceState({ segments: imported, discussions: [] })
-    pushHistoryEntry(imported[0].id, 'import', '', file.name)
-    setSelectedSegmentId(imported[0].id)
+    beginMigration(await file.text(), file.name)
     event.target.value = ''
+  }
+  const loadSampleV2 = () => beginMigration(sampleV2Markdown, sampleV2SourceFile)
+  const updateMigrationSession = (next: MigrationSession) => setMigrationSession(next)
+  const discardMigration = () => setMigrationSession(null)
+  const applyMigrationSession = async (session: MigrationSession) => {
+    if (session.pending.length) return
+    setApplyingMigration(true)
+    // 应用前留存快照，迁移结果可通过撤销整体回退到迁移前草稿。
+    setPast((current) => [...current.slice(-49), snapshot()])
+    setFuture([])
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    const result = applyMigration(session, { discussions, history, conflicts })
+    const nextArchived = [...result.archived, ...archived]
+    setSegments(result.segments)
+    setDiscussions(result.discussions)
+    setHistory(result.history)
+    setConflicts(result.conflicts)
+    setArchived(nextArchived)
+    setSourceFile(session.sourceFile)
+    setSelectedSegmentId(result.segments[0]?.id ?? '')
+    setFilter('needs-review')
+    setMigrationSession(null)
+    setDirty(true)
+    setApplyingMigration(false)
+    try { localStorage.setItem(DRAFT_KEY, JSON.stringify({ segments: result.segments, discussions: result.discussions, glossary, history: result.history, conflicts: result.conflicts, archived: nextArchived, sourceFile: session.sourceFile })) } catch { /* storage may be unavailable */ }
+    // 迁移后按当前术语表重新检查。
+    try {
+      const response = await fetch('/api/check', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ segments: result.segments, glossary }) })
+      if (response.ok) {
+        const data = await response.json() as { issues: TranslationIssue[] }
+        setCheckedIssues(data.issues)
+      }
+    } catch { /* offline fall back to live analysis */ }
   }
   const exportMarkdown = () => {
     const blob = new Blob([renderTargetMarkdown(segments)], { type: 'text/markdown;charset=utf-8' })
     const url = URL.createObjectURL(blob)
     const anchor = document.createElement('a')
     anchor.href = url
-    anchor.download = documentQuery.data.sourceFile.replace(/\.md$/, '.zh-CN.md')
+    anchor.download = sourceFile.replace(/\.md$/, '.zh-CN.md')
     anchor.click()
     URL.revokeObjectURL(url)
   }
@@ -277,6 +360,7 @@ export function LocalizationWorkbench() {
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
+      if (migrationSession) return
       const target = event.target as HTMLElement
       const editing = ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName) || target.isContentEditable
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'z') {
@@ -298,7 +382,7 @@ export function LocalizationWorkbench() {
         <div className="mx-auto flex max-w-[1800px] items-center gap-5 px-4 py-3 lg:px-6">
           <div className="flex min-w-0 items-center gap-3">
             <div className="grid h-10 w-10 shrink-0 place-items-center rounded-xl border border-blue-400/30 bg-blue-500/15 text-blue-300"><Languages className="h-5 w-5" /></div>
-            <div className="min-w-0"><h1 className="truncate font-semibold tracking-tight">开源文档本地化工作台</h1><p className="truncate text-[11px] text-slate-400">{documentQuery.data.sourceFile} · {documentQuery.data.title}</p></div>
+            <div className="min-w-0"><h1 className="truncate font-semibold tracking-tight">开源文档本地化工作台</h1><p className="truncate text-[11px] text-slate-400">{sourceFile} · {documentQuery.data.title}</p></div>
           </div>
           <div className="hidden items-center gap-2 md:flex">
             <Badge className={cn(mockConnected ? 'bg-emerald-500/15 text-emerald-300' : 'bg-amber-500/15 text-amber-300', 'border-0')}>{mockConnected ? <Cloud className="mr-1 h-3 w-3" /> : <CloudOff className="mr-1 h-3 w-3" />}{mockConnected ? 'MSW 已连接' : '连接模拟接口'}</Badge>
@@ -309,7 +393,8 @@ export function LocalizationWorkbench() {
             <Button variant="outline" size="sm" className="border-slate-700 bg-slate-900 text-slate-200 hover:bg-slate-800 hover:text-white" onClick={undo} disabled={!past.length}><Undo2 className="h-4 w-4" />撤销</Button>
             <Button variant="outline" size="sm" className="border-slate-700 bg-slate-900 text-slate-200 hover:bg-slate-800 hover:text-white" onClick={redo} disabled={!future.length}><RotateCw className="h-4 w-4" />重做</Button>
             <input ref={fileInput} type="file" accept=".md,.markdown,text/markdown" className="hidden" onChange={(event) => void importMarkdown(event)} />
-            <Button variant="outline" size="sm" className="border-slate-700 bg-slate-900 text-slate-200 hover:bg-slate-800 hover:text-white" onClick={() => fileInput.current?.click()}><Import className="h-4 w-4" />导入</Button>
+            <Button variant="outline" size="sm" className="border-violet-700/60 bg-violet-950/60 text-violet-200 hover:bg-violet-900 hover:text-white" onClick={loadSampleV2} title="载入内置新版文档，演示版本迁移"><GitPullRequestArrow className="h-4 w-4" />新版迁移示例</Button>
+            <Button variant="outline" size="sm" className="border-slate-700 bg-slate-900 text-slate-200 hover:bg-slate-800 hover:text-white" onClick={() => fileInput.current?.click()}><Import className="h-4 w-4" />导入新版</Button>
             <Button size="sm" onClick={() => saveMutation.mutate()} disabled={saveMutation.isPending}><Save className="h-4 w-4" />保存</Button>
           </div>
         </div>
@@ -321,6 +406,7 @@ export function LocalizationWorkbench() {
           <span><b className="text-slate-900">{translatedCount}</b> 已翻译</span>
           <span className="flex items-center gap-1"><CircleAlert className="h-3.5 w-3.5 text-amber-600" /><b className="text-slate-900">{issues.length}</b> 个检查结果</span>
           <span className="flex items-center gap-1"><CheckCheck className="h-3.5 w-3.5 text-emerald-600" /><b className="text-slate-900">{confirmedCount}</b> 已确认</span>
+          {archived.length > 0 && <span className="flex items-center gap-1"><Archive className="h-3.5 w-3.5 text-slate-400" /><b className="text-slate-900">{archived.length}</b> 已归档</span>}
           <div className="ml-auto flex min-w-[220px] items-center gap-3"><span>审校进度 {progress}%</span><Progress value={progress} className="w-36" /></div>
           <Button size="sm" variant="secondary" onClick={() => checkMutation.mutate()} disabled={checkMutation.isPending}>{checkMutation.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <ShieldCheck className="h-4 w-4" />}运行本地术语检查</Button>
           <Button size="sm" variant="outline" onClick={exportMarkdown}><Download className="h-4 w-4" />导出译文</Button>
@@ -360,7 +446,7 @@ export function LocalizationWorkbench() {
         <section className="workbench-center min-w-0 space-y-3">
           <div className="flex flex-wrap items-center gap-2 rounded-xl border bg-white p-2.5 shadow-sm">
             <div className="flex items-center rounded-lg bg-slate-100 p-1">
-              {([['all', '全部'], ['issues', '问题'], ['untranslated', '漏译'], ['confirmed', '已确认']] as const).map(([value, label]) => <button key={value} onClick={() => setFilter(value)} className={cn('rounded-md px-3 py-1.5 text-xs font-medium transition', filter === value ? 'bg-white text-blue-700 shadow-sm' : 'text-slate-500 hover:text-slate-800')}>{label}</button>)}
+              {([['all', '全部'], ['issues', '问题'], ['untranslated', '漏译'], ['needs-review', '待复核'], ['confirmed', '已确认']] as const).map(([value, label]) => <button key={value} onClick={() => setFilter(value)} className={cn('rounded-md px-3 py-1.5 text-xs font-medium transition', filter === value ? 'bg-white text-blue-700 shadow-sm' : 'text-slate-500 hover:text-slate-800')}>{label}</button>)}
             </div>
             <div className="ml-auto flex items-center gap-2 text-xs text-slate-500"><span>{filteredSegments.length} / {segments.length}</span><Button variant="outline" size="sm" onClick={() => nextIssue(-1)}><ArrowUp className="h-3.5 w-3.5" />上一问题</Button><Button variant="outline" size="sm" onClick={() => nextIssue(1)}>下一问题<ArrowDown className="h-3.5 w-3.5" /></Button></div>
           </div>
@@ -376,6 +462,9 @@ export function LocalizationWorkbench() {
                   <span className="text-[11px] font-semibold text-slate-500">#{String(segment.index).padStart(2, '0')}</span>
                   <Badge variant="outline" className="gap-1 text-[10px]">{kindIcon[segment.kind]}{kindLabel[segment.kind]}</Badge>
                   <span className={cn('rounded-full px-2 py-0.5 text-[10px] font-medium', statusClass[segment.status])}>{statusLabel[segment.status]}</span>
+                  {segment.migratedMatch && migratedLabel[segment.migratedMatch] && (
+                    <Badge variant="outline" className={cn('gap-1 text-[10px]', segment.status === 'needs-review' && 'border-orange-300 text-orange-700')}><GitPullRequestArrow className="h-3 w-3" />{migratedLabel[segment.migratedMatch]}</Badge>
+                  )}
                   {segment.protectedTokens.length > 0 && <Badge variant="secondary" className="gap-1 text-[10px]"><Variable className="h-3 w-3" />{segment.protectedTokens.length} 个受保护标记</Badge>}
                   {!!segmentIssues.length && <Badge variant="destructive" className="ml-auto">{segmentIssues.length} 个问题</Badge>}
                   <div className={cn('flex gap-1.5', !segmentIssues.length && 'ml-auto')}>
@@ -405,22 +494,33 @@ export function LocalizationWorkbench() {
         <aside className="workbench-right min-w-0">
           <Card className="sticky top-[74px] max-h-[calc(100vh-96px)] overflow-hidden">
             <Tabs defaultValue="discussion" className="flex h-full flex-col">
-              <TabsList className="mx-3 mt-3 grid grid-cols-4"><TabsTrigger id="discussion-tab" value="discussion" className="px-1 text-[11px]">讨论</TabsTrigger><TabsTrigger value="issues" className="px-1 text-[11px]">问题</TabsTrigger><TabsTrigger value="history" className="px-1 text-[11px]">历史</TabsTrigger><TabsTrigger value="conflicts" className="px-1 text-[11px]">冲突 {conflicts.length ? `(${conflicts.length})` : ''}</TabsTrigger></TabsList>
+              <TabsList className="mx-3 mt-3 grid grid-cols-5"><TabsTrigger id="discussion-tab" value="discussion" className="px-1 text-[11px]">讨论</TabsTrigger><TabsTrigger value="issues" className="px-1 text-[11px]">问题</TabsTrigger><TabsTrigger value="history" className="px-1 text-[11px]">历史</TabsTrigger><TabsTrigger value="conflicts" className="px-1 text-[11px]">冲突 {conflicts.length ? `(${conflicts.length})` : ''}</TabsTrigger><TabsTrigger value="archive" className="px-1 text-[11px]">归档 {archived.length ? `(${archived.length})` : ''}</TabsTrigger></TabsList>
               <TabsContent value="discussion" className="m-0 max-h-[calc(100vh-160px)] overflow-auto p-3">
                 <div className="rounded-lg border border-blue-100 bg-blue-50/60 p-2.5"><p className="text-[10px] font-semibold text-blue-800">当前片段 #{selectedSegment?.index}</p><p className="mt-1 line-clamp-3 text-xs leading-5 text-blue-700">{selectedSegment?.targetText || selectedSegment?.sourceText}</p></div>
                 <div className="mt-3 flex gap-2"><Textarea value={discussionDraft} onChange={(event) => setDiscussionDraft(event.target.value)} rows={2} placeholder="针对当前句子留下讨论…" className="text-xs" /><Button size="icon" className="h-auto self-stretch" onClick={addDiscussion}><Send className="h-4 w-4" /></Button></div>
                 <div className="mt-4 space-y-3">{selectedDiscussions.map((discussion) => <div key={discussion.id} className="rounded-lg border p-3"><div className="flex items-center justify-between"><b className="text-xs text-slate-800">{discussion.author}</b><Badge variant={discussion.resolved ? 'success' : 'warning'}>{discussion.resolved ? '已解决' : '待回应'}</Badge></div><p className="mt-2 text-xs leading-5 text-slate-600">{discussion.body}</p><p className="mt-2 text-[10px] text-slate-400">{hydrated ? new Date(discussion.createdAt).toLocaleString('zh-CN') : null}</p></div>)}{!selectedDiscussions.length && <p className="py-8 text-center text-xs text-slate-400">当前片段还没有讨论</p>}</div>
               </TabsContent>
               <TabsContent value="issues" className="m-0 max-h-[calc(100vh-160px)] overflow-auto p-3"><div className="space-y-2">{issues.map((issue) => <button key={issue.id} onClick={() => selectAndScroll(issue.segmentId)} className="w-full rounded-lg border p-3 text-left hover:border-amber-300 hover:bg-amber-50"><div className="flex items-center justify-between"><Badge variant={issue.severity === 'error' ? 'destructive' : 'warning'}>{issueLabel[issue.type]}</Badge><span className="text-[10px] text-slate-400">#{segments.find((item) => item.id === issue.segmentId)?.index}</span></div><p className="mt-2 text-xs leading-5 text-slate-600">{issue.message}</p></button>)}{!issues.length && <p className="py-8 text-center text-xs text-emerald-600">没有待处理问题</p>}</div></TabsContent>
-              <TabsContent value="history" className="m-0 max-h-[calc(100vh-160px)] overflow-auto p-3"><div className="space-y-0">{history.map((entry) => <div key={entry.id} className="relative border-l border-slate-200 pb-4 pl-4"><span className="absolute -left-1.5 top-0 h-3 w-3 rounded-full border-2 border-white bg-blue-500" /><div className="flex items-center justify-between"><b className="text-[11px] text-slate-700">{entry.author}</b><span className="text-[9px] text-slate-400">{hydrated ? new Date(entry.createdAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }) : null}</span></div><p className="mt-1 text-[10px] text-slate-500">片段 #{segments.find((item) => item.id === entry.segmentId)?.index ?? '—'} · {entry.action}</p>{entry.after && <p className="mt-1 line-clamp-2 text-[10px] leading-4 text-slate-400">{entry.after}</p>}</div>)}</div></TabsContent>
+              <TabsContent value="history" className="m-0 max-h-[calc(100vh-160px)] overflow-auto p-3"><div className="space-y-0">{history.map((entry) => <div key={entry.id} className="relative border-l border-slate-200 pb-4 pl-4"><span className="absolute -left-1.5 top-0 h-3 w-3 rounded-full border-2 border-white bg-blue-500" /><div className="flex items-center justify-between"><b className="text-[11px] text-slate-700">{entry.author}</b><span className="text-[9px] text-slate-400">{hydrated ? new Date(entry.createdAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }) : null}</span></div><p className="mt-1 text-[10px] text-slate-500">片段 #{segments.find((item) => item.id === entry.segmentId)?.index ?? '—'} · {historyActionLabel[entry.action]}</p>{entry.after && <p className="mt-1 line-clamp-2 text-[10px] leading-4 text-slate-400">{entry.after}</p>}</div>)}</div></TabsContent>
               <TabsContent value="conflicts" className="m-0 max-h-[calc(100vh-160px)] overflow-auto p-3"><div className="space-y-3">{conflicts.map((conflict) => <div key={conflict.id} className="overflow-hidden rounded-lg border border-red-200"><div className="bg-red-50 px-3 py-2"><b className="text-xs text-red-800">片段 #{segments.find((item) => item.id === conflict.segmentId)?.index} 存在并发修改</b><p className="mt-1 text-[10px] text-red-600">{conflict.remoteAuthor} 修改了同一句</p></div><div className="space-y-2 p-3"><div><span className="text-[9px] font-semibold text-slate-400">本地版本</span><p className="mt-1 text-[11px] leading-5 text-slate-600">{conflict.localText}</p></div><div><span className="text-[9px] font-semibold text-slate-400">远端版本</span><p className="mt-1 text-[11px] leading-5 text-blue-700">{conflict.remoteText}</p></div><div className="flex gap-2"><Button size="sm" variant="outline" onClick={() => resolveConflict(conflict, 'local')}>保留本地</Button><Button size="sm" onClick={() => resolveConflict(conflict, 'remote')}>采用远端</Button></div></div></div>)}{!conflicts.length && <div className="rounded-lg border border-emerald-200 bg-emerald-50 p-4 text-center text-xs text-emerald-700"><Check className="mx-auto mb-2 h-5 w-5" />所有冲突已解决</div>}</div></TabsContent>
+              <TabsContent value="archive" className="m-0 max-h-[calc(100vh-160px)] overflow-auto p-3"><div className="space-y-3">{archived.map((item) => <div key={item.segment.id} className="rounded-lg border border-slate-200 bg-slate-50 p-3"><div className="flex items-center justify-between gap-2"><Badge variant="secondary" className="gap-1 text-[10px]"><Archive className="h-3 w-3" />旧版块 #{item.segment.index}</Badge><Badge variant="outline" className="text-[9px]">{kindLabel[item.segment.kind]}</Badge></div><p className="document-prose mt-2 line-clamp-4 text-[11px] leading-5 text-slate-500">{item.segment.sourceText}</p>{item.segment.targetText && <p className="document-prose mt-1.5 line-clamp-4 border-t border-dashed pt-1.5 text-[11px] leading-5 text-blue-700">{item.segment.targetText}</p>}<div className="mt-2 flex flex-wrap gap-2 text-[10px] text-slate-400"><span>{item.discussions.length} 条讨论</span><span>·</span><span>{item.history.length} 条历史</span><span>·</span><span>{item.conflicts.length} 个冲突</span><span>·</span><span>{new Date(item.archivedAt).toLocaleDateString('zh-CN')} 归档</span></div></div>)}{!archived.length && <p className="py-8 text-center text-xs text-slate-400">还没有归档内容；版本迁移时，旧版移除的内容块会连同译文、讨论和历史进入这里。</p>}</div></TabsContent>
             </Tabs>
           </Card>
           <div className="mt-3 rounded-xl border bg-slate-950 px-3 py-3 text-[10px] text-slate-400"><p className="mb-2 font-semibold text-slate-200">键盘操作</p><div className="grid grid-cols-2 gap-2"><span><kbd>J</kbd> 下一问题</span><span><kbd>K</kbd> 上一问题</span><span><kbd>C</kbd> 确认</span><span><kbd>R</kbd> 退回</span><span><kbd>⌘ Z</kbd> 撤销</span><span><kbd>⌘ ⇧ Z</kbd> 重做</span></div></div>
         </aside>
       </main>
 
-      {selectedForReturn.size > 0 && <div className="fixed bottom-0 left-0 right-0 z-50 border-t bg-slate-950 px-4 py-3 text-white shadow-2xl"><div className="mx-auto flex max-w-[1800px] items-center gap-3"><ShieldCheck className="h-4 w-4 text-amber-300" /><span className="text-xs">已选择 <b>{selectedForReturn.size}</b> 个片段</span><Input value={returnReason} onChange={(event) => setReturnReason(event.target.value)} className="ml-auto max-w-lg border-slate-700 bg-slate-900 text-white" /><Button variant="destructive" size="sm" onClick={bulkReturn}>确认批量退回</Button><Button variant="ghost" size="sm" className="text-slate-300" onClick={() => setSelectedForReturn(new Set())}>取消</Button></div></div>}
+      {selectedForReturn.size > 0 && !migrationSession && <div className="fixed bottom-0 left-0 right-0 z-50 border-t bg-slate-950 px-4 py-3 text-white shadow-2xl"><div className="mx-auto flex max-w-[1800px] items-center gap-3"><ShieldCheck className="h-4 w-4 text-amber-300" /><span className="text-xs">已选择 <b>{selectedForReturn.size}</b> 个片段</span><Input value={returnReason} onChange={(event) => setReturnReason(event.target.value)} className="ml-auto max-w-lg border-slate-700 bg-slate-900 text-white" /><Button variant="destructive" size="sm" onClick={bulkReturn}>确认批量退回</Button><Button variant="ghost" size="sm" className="text-slate-300" onClick={() => setSelectedForReturn(new Set())}>取消</Button></div></div>}
+
+      {migrationSession && (
+        <MigrationWizard
+          session={migrationSession}
+          applying={applyingMigration}
+          onSessionChange={updateMigrationSession}
+          onApply={(session) => void applyMigrationSession(session)}
+          onDiscard={discardMigration}
+        />
+      )}
     </div>
   )
 }
