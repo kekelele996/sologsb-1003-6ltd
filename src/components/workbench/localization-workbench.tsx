@@ -4,7 +4,7 @@ import { useEffect, useMemo, useRef, useState, type ChangeEvent } from 'react'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import {
   AlertCircle, ArrowDown, ArrowUp, BookOpen, Check, CheckCheck, ChevronLeft, ChevronRight,
-  CircleAlert, Cloud, CloudOff, Code2, Download, FileText, GitCompare, History, Import,
+  CircleAlert, Cloud, CloudOff, Code2, Download, FileText, GitBranch, GitCompare, History, Import,
   Languages, Link2, Loader2, MessageSquare, RefreshCw, RotateCcw, RotateCw, Save, Search,
   Send, ShieldCheck, Sparkles, Undo2, UndoDot, Variable, X,
 } from 'lucide-react'
@@ -16,11 +16,18 @@ import { Progress } from '@/components/ui/progress'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Textarea } from '@/components/ui/textarea'
 import { analyzeDocument, extractVariables, parseMarkdown, renderTargetMarkdown } from '@/lib/markdown'
+import {
+  acceptAllRecommendations, allDecisionsResolved, applyMigration, pendingDecisionCount,
+  updateResolution, type ArchivedBlock, type MigrationPlan,
+} from '@/lib/migration'
 import { seedConflicts, seedDiscussions, seedDocument, seedGlossary, seedHistory, seedSegments } from '@/lib/seed'
 import type { Discussion, GlossaryTerm, HistoryEntry, Segment, SegmentStatus, TranslationConflict, TranslationIssue } from '@/lib/types'
 import { cn } from '@/lib/utils'
+import { MigrationDialog } from './migration-dialog'
 
 const DRAFT_KEY = 'sologsb-1003-localization-draft-v1'
+const MIGRATION_PLAN_KEY = 'sologsb-1003-migration-plan-v1'
+const ARCHIVE_KEY = 'sologsb-1003-archive-v1'
 const kindIcon = { heading: <FileText className="h-3.5 w-3.5" />, paragraph: <FileText className="h-3.5 w-3.5" />, code: <Code2 className="h-3.5 w-3.5" />, link: <Link2 className="h-3.5 w-3.5" />, variable: <Variable className="h-3.5 w-3.5" /> }
 const kindLabel: Record<Segment['kind'], string> = { heading: '标题', paragraph: '段落', code: '代码块', link: '链接', variable: '占位符' }
 const statusLabel: Record<SegmentStatus, string> = { draft: '草稿', 'needs-work': '待处理', confirmed: '已确认', returned: '已退回' }
@@ -57,6 +64,10 @@ export function LocalizationWorkbench() {
   const [hydrated, setHydrated] = useState(false)
   const [past, setPast] = useState<EditorSnapshot[]>([])
   const [future, setFuture] = useState<EditorSnapshot[]>([])
+  const [migrationPlan, setMigrationPlan] = useState<MigrationPlan | null>(null)
+  const [migrationDialogOpen, setMigrationDialogOpen] = useState(false)
+  const [archive, setArchive] = useState<ArchivedBlock[]>([])
+  const [documentMeta, setDocumentMeta] = useState({ sourceFile: seedDocument.sourceFile, title: seedDocument.title })
 
   const documentQuery = useQuery({
     queryKey: ['localization-document'],
@@ -87,8 +98,8 @@ export function LocalizationWorkbench() {
   })
 
   const checkMutation = useMutation({
-    mutationFn: async () => {
-      const response = await fetch('/api/check', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ segments, glossary }) })
+    mutationFn: async (targetSegments?: Segment[]) => {
+      const response = await fetch('/api/check', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ segments: targetSegments ?? segments, glossary }) })
       if (!response.ok) throw new Error('check failed')
       return response.json() as Promise<{ checkedAt: number; issues: TranslationIssue[] }>
     },
@@ -113,6 +124,22 @@ export function LocalizationWorkbench() {
       const response = await fetch('/api/review', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
       if (!response.ok) throw new Error('review failed')
       return response.json()
+    },
+  })
+  const analyzeMigrationMutation = useMutation({
+    mutationFn: async (file: File) => {
+      const markdown = await file.text()
+      const response = await fetch('/api/migration/analyze', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ segments, markdown, fileName: file.name, discussions, history, conflicts }),
+      })
+      if (!response.ok) throw new Error('migration analyze failed')
+      return response.json() as Promise<{ plan: MigrationPlan }>
+    },
+    onSuccess: ({ plan }) => {
+      setMigrationPlan(plan)
+      setMigrationDialogOpen(true)
     },
   })
 
@@ -142,13 +169,24 @@ export function LocalizationWorkbench() {
     try {
       const raw = localStorage.getItem(DRAFT_KEY)
       if (raw) {
-        const draft = JSON.parse(raw) as { segments: Segment[]; discussions: Discussion[]; glossary: GlossaryTerm[]; history: HistoryEntry[] }
+        const draft = JSON.parse(raw) as { segments: Segment[]; discussions: Discussion[]; glossary: GlossaryTerm[]; history: HistoryEntry[]; documentMeta?: { sourceFile: string; title: string } }
         if (draft.segments?.length) {
           setSegments(draft.segments)
           setDiscussions(draft.discussions ?? seedDiscussions)
           setGlossary(draft.glossary ?? seedGlossary)
           setHistory(draft.history ?? seedHistory)
+          if (draft.documentMeta) setDocumentMeta(draft.documentMeta)
         }
+      }
+      const migrationRaw = localStorage.getItem(MIGRATION_PLAN_KEY)
+      if (migrationRaw) {
+        const plan = JSON.parse(migrationRaw) as MigrationPlan
+        if (plan?.newBlocks?.length) setMigrationPlan(plan)
+      }
+      const archiveRaw = localStorage.getItem(ARCHIVE_KEY)
+      if (archiveRaw) {
+        const stored = JSON.parse(archiveRaw) as ArchivedBlock[]
+        if (Array.isArray(stored)) setArchive(stored)
       }
     } catch { /* start from seed */ }
     setHydrated(true)
@@ -156,8 +194,18 @@ export function LocalizationWorkbench() {
 
   useEffect(() => {
     if (!hydrated) return
-    try { localStorage.setItem(DRAFT_KEY, JSON.stringify({ segments, discussions, glossary, history })) } catch { /* storage may be unavailable */ }
-  }, [discussions, glossary, history, hydrated, segments])
+    try { localStorage.setItem(DRAFT_KEY, JSON.stringify({ segments, discussions, glossary, history, documentMeta })) } catch { /* storage may be unavailable */ }
+  }, [discussions, glossary, history, hydrated, segments, documentMeta])
+
+  useEffect(() => {
+    if (!hydrated) return
+    try { localStorage.setItem(MIGRATION_PLAN_KEY, JSON.stringify(migrationPlan)) } catch { /* storage may be unavailable */ }
+  }, [hydrated, migrationPlan])
+
+  useEffect(() => {
+    if (!hydrated) return
+    try { localStorage.setItem(ARCHIVE_KEY, JSON.stringify(archive)) } catch { /* storage may be unavailable */ }
+  }, [hydrated, archive])
 
   useEffect(() => {
     const beforeUnload = (event: BeforeUnloadEvent) => {
@@ -258,12 +306,55 @@ export function LocalizationWorkbench() {
     setSelectedSegmentId(imported[0].id)
     event.target.value = ''
   }
+  const handlePickMigrationFile = (file: File) => {
+    analyzeMigrationMutation.mutate(file)
+  }
+  const handleUpdateResolution = (decisionId: string, newId: string, oldId: string | null) => {
+    setMigrationPlan((plan) => (plan ? updateResolution(plan, decisionId, newId, oldId) : plan))
+  }
+  const handleAcceptAllRecommendations = () => {
+    setMigrationPlan((plan) => (plan ? acceptAllRecommendations(plan) : plan))
+  }
+  const handleDiscardMigration = () => {
+    setMigrationPlan(null)
+    setMigrationDialogOpen(false)
+  }
+  const handleApplyMigration = () => {
+    if (!migrationPlan) return
+    const result = applyMigration(migrationPlan, { discussions, history, conflicts })
+    const exactCount = migrationPlan.pairs.filter((p) => p.kind === 'exact').length
+    const fuzzyCount = migrationPlan.pairs.filter((p) => p.kind === 'fuzzy').length
+    const addedCount = migrationPlan.newBlocks.length - migrationPlan.pairs.length - migrationPlan.decisions.reduce((n, d) => n + d.newIds.length, 0)
+    const migrationEntry: HistoryEntry = {
+      id: `history-migration-${Date.now()}`,
+      segmentId: result.segments[0]?.id ?? '',
+      author: '系统',
+      action: 'import',
+      before: '',
+      after: `迁移至 ${migrationPlan.fileName}：沿用 ${exactCount} 段，轻改待复核 ${fuzzyCount} 段，归档 ${result.archive.length} 段，新增 ${Math.max(0, addedCount)} 段。`,
+      createdAt: Date.now(),
+    }
+    setSegments(result.segments)
+    setDiscussions(result.discussions)
+    setHistory([migrationEntry, ...result.history])
+    setConflicts(result.conflicts)
+    setArchive((current) => [...result.archive, ...current])
+    setDocumentMeta({ sourceFile: migrationPlan.fileName, title: documentMeta.title })
+    setMigrationPlan(null)
+    setMigrationDialogOpen(false)
+    setPast([])
+    setFuture([])
+    setCheckedIssues(null)
+    setSelectedSegmentId(result.segments[0]?.id ?? '')
+    setDirty(true)
+    checkMutation.mutate(result.segments)
+  }
   const exportMarkdown = () => {
     const blob = new Blob([renderTargetMarkdown(segments)], { type: 'text/markdown;charset=utf-8' })
     const url = URL.createObjectURL(blob)
     const anchor = document.createElement('a')
     anchor.href = url
-    anchor.download = documentQuery.data.sourceFile.replace(/\.md$/, '.zh-CN.md')
+    anchor.download = documentMeta.sourceFile.replace(/\.md$/, '.zh-CN.md')
     anchor.click()
     URL.revokeObjectURL(url)
   }
@@ -298,7 +389,7 @@ export function LocalizationWorkbench() {
         <div className="mx-auto flex max-w-[1800px] items-center gap-5 px-4 py-3 lg:px-6">
           <div className="flex min-w-0 items-center gap-3">
             <div className="grid h-10 w-10 shrink-0 place-items-center rounded-xl border border-blue-400/30 bg-blue-500/15 text-blue-300"><Languages className="h-5 w-5" /></div>
-            <div className="min-w-0"><h1 className="truncate font-semibold tracking-tight">开源文档本地化工作台</h1><p className="truncate text-[11px] text-slate-400">{documentQuery.data.sourceFile} · {documentQuery.data.title}</p></div>
+            <div className="min-w-0"><h1 className="truncate font-semibold tracking-tight">开源文档本地化工作台</h1><p className="truncate text-[11px] text-slate-400">{documentMeta.sourceFile} · {documentMeta.title}</p></div>
           </div>
           <div className="hidden items-center gap-2 md:flex">
             <Badge className={cn(mockConnected ? 'bg-emerald-500/15 text-emerald-300' : 'bg-amber-500/15 text-amber-300', 'border-0')}>{mockConnected ? <Cloud className="mr-1 h-3 w-3" /> : <CloudOff className="mr-1 h-3 w-3" />}{mockConnected ? 'MSW 已连接' : '连接模拟接口'}</Badge>
@@ -310,6 +401,10 @@ export function LocalizationWorkbench() {
             <Button variant="outline" size="sm" className="border-slate-700 bg-slate-900 text-slate-200 hover:bg-slate-800 hover:text-white" onClick={redo} disabled={!future.length}><RotateCw className="h-4 w-4" />重做</Button>
             <input ref={fileInput} type="file" accept=".md,.markdown,text/markdown" className="hidden" onChange={(event) => void importMarkdown(event)} />
             <Button variant="outline" size="sm" className="border-slate-700 bg-slate-900 text-slate-200 hover:bg-slate-800 hover:text-white" onClick={() => fileInput.current?.click()}><Import className="h-4 w-4" />导入</Button>
+            <Button variant="outline" size="sm" className="relative border-blue-400/40 bg-blue-500/10 text-blue-200 hover:bg-blue-500/20 hover:text-white" onClick={() => setMigrationDialogOpen(true)}>
+              <GitBranch className="h-4 w-4" />版本迁移
+              {migrationPlan && pendingDecisionCount(migrationPlan) > 0 && <Badge variant="destructive" className="ml-1 h-4 px-1 text-[10px]">{pendingDecisionCount(migrationPlan)}</Badge>}
+            </Button>
             <Button size="sm" onClick={() => saveMutation.mutate()} disabled={saveMutation.isPending}><Save className="h-4 w-4" />保存</Button>
           </div>
         </div>
@@ -326,6 +421,21 @@ export function LocalizationWorkbench() {
           <Button size="sm" variant="outline" onClick={exportMarkdown}><Download className="h-4 w-4" />导出译文</Button>
         </div>
       </div>
+
+      {migrationPlan && !migrationDialogOpen && (
+        <div className="border-b border-amber-200 bg-amber-50 px-4 py-2 lg:px-6">
+          <div className="mx-auto flex max-w-[1800px] flex-wrap items-center gap-2 text-xs text-amber-800">
+            <GitBranch className="h-4 w-4 shrink-0" />
+            <span>有未完成的版本迁移：<b>{migrationPlan.fileName}</b></span>
+            <span className="text-amber-600">·</span>
+            <span>{pendingDecisionCount(migrationPlan)} 项待决定</span>
+            <span className="text-amber-600">·</span>
+            <span>处理完前不会覆盖当前草稿</span>
+            <Button size="sm" variant="outline" className="ml-auto border-amber-300 bg-white text-amber-800 hover:bg-amber-100" onClick={() => setMigrationDialogOpen(true)}>继续处理</Button>
+            <Button size="sm" variant="ghost" className="text-amber-700 hover:bg-amber-100" onClick={handleDiscardMigration}>放弃</Button>
+          </div>
+        </div>
+      )}
 
       <main className="workbench-grid mx-auto grid max-w-[1800px] grid-cols-[270px_minmax(620px,1fr)_340px] gap-4 p-4 lg:p-5">
         <aside className="workbench-left space-y-4">
@@ -421,6 +531,19 @@ export function LocalizationWorkbench() {
       </main>
 
       {selectedForReturn.size > 0 && <div className="fixed bottom-0 left-0 right-0 z-50 border-t bg-slate-950 px-4 py-3 text-white shadow-2xl"><div className="mx-auto flex max-w-[1800px] items-center gap-3"><ShieldCheck className="h-4 w-4 text-amber-300" /><span className="text-xs">已选择 <b>{selectedForReturn.size}</b> 个片段</span><Input value={returnReason} onChange={(event) => setReturnReason(event.target.value)} className="ml-auto max-w-lg border-slate-700 bg-slate-900 text-white" /><Button variant="destructive" size="sm" onClick={bulkReturn}>确认批量退回</Button><Button variant="ghost" size="sm" className="text-slate-300" onClick={() => setSelectedForReturn(new Set())}>取消</Button></div></div>}
+
+      <MigrationDialog
+        open={migrationDialogOpen}
+        onOpenChange={setMigrationDialogOpen}
+        plan={migrationPlan}
+        analyzing={analyzeMigrationMutation.isPending}
+        applying={false}
+        onPickFile={handlePickMigrationFile}
+        onUpdateResolution={handleUpdateResolution}
+        onAcceptAll={handleAcceptAllRecommendations}
+        onApply={handleApplyMigration}
+        onDiscard={handleDiscardMigration}
+      />
     </div>
   )
 }

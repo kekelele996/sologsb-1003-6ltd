@@ -1,7 +1,8 @@
 import { http, HttpResponse } from 'msw'
 import { analyzeDocument } from '@/lib/markdown'
+import { analyzeMigration } from '@/lib/migration'
 import { seedConflicts, seedDocument, seedHistory } from '@/lib/seed'
-import type { GlossaryTerm, Segment } from '@/lib/types'
+import type { Discussion, GlossaryTerm, HistoryEntry, Segment, TranslationConflict } from '@/lib/types'
 
 const clone = <T,>(value: T): T => JSON.parse(JSON.stringify(value)) as T
 
@@ -23,5 +24,11 @@ export const handlers = [
     const body = await request.json() as { action: string; segmentIds: string[]; reason?: string }
     await new Promise((resolve) => setTimeout(resolve, 280))
     return HttpResponse.json({ accepted: true, ...body, reviewedAt: Date.now() })
+  }),
+  http.post('/api/migration/analyze', async ({ request }) => {
+    const body = await request.json() as { segments: Segment[]; markdown: string; fileName: string; discussions: Discussion[]; history: HistoryEntry[]; conflicts: TranslationConflict[] }
+    await new Promise((resolve) => setTimeout(resolve, 420))
+    const plan = analyzeMigration(body.segments, body.markdown, body.fileName, body.discussions, body.history, body.conflicts)
+    return HttpResponse.json({ plan })
   }),
 ]
